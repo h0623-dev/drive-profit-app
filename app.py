@@ -20,7 +20,7 @@ def inject_css():
     st.markdown(
         """
         <style>
-        .block-container {padding-top: 1.0rem; padding-bottom: 2rem; max-width: 1200px;}
+        .block-container {padding-top: 0.8rem; padding-bottom: 2rem; max-width: 1200px;}
         h1,h2,h3 {letter-spacing:-0.2px;}
         section[data-testid="stSidebar"] {background: #fbfbfd;}
         section[data-testid="stSidebar"] .block-container {padding-top: 1rem;}
@@ -83,7 +83,6 @@ def fmt_won_per_l(x) -> str:
 def fmt_pct(x) -> str:
     return f"{iround(x)}%"
 
-# input auto-format (unit inside textbox)
 def unit_formatter(key: str, unit: str, edited_flag: str | None = None):
     def _cb():
         n = parse_int(st.session_state.get(key, ""))
@@ -139,17 +138,124 @@ def _kakao_headers():
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-def col_exists(conn: sqlite3.Connection, table: str, col: str) -> bool:
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     cur = conn.cursor()
     cur.execute(f"PRAGMA table_info({table})")
-    cols = {r[1] for r in cur.fetchall()}
-    return col in cols
+    return {r[1] for r in cur.fetchall()}
+
+def migrate_trips_table_if_needed(conn: sqlite3.Connection):
+    """
+    Streamlit Cloud에 예전 스키마(trips)가 남아 있을 때 자동 업그레이드.
+    """
+    try:
+        cols = _table_columns(conn, "trips")
+    except Exception:
+        return
+
+    required = {
+        "paid_oneway_km", "empty_oneway_km", "total_km",
+        "fare_krw", "fuel_price_krw_per_l", "toll_krw", "parking_krw", "other_krw",
+        "fuel_used_l", "fuel_cost_krw", "total_cost_krw", "profit_krw", "profit_pct",
+        "origin_text", "dest_text", "route_mode",
+    }
+    if required.issubset(cols):
+        return  # already new schema
+
+    cur = conn.cursor()
+
+    # create v2
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS trips_v2(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        trip_date TEXT NOT NULL,
+        vehicle_id INTEGER NOT NULL,
+        trip_type TEXT NOT NULL,
+
+        paid_oneway_km REAL NOT NULL,
+        empty_oneway_km REAL NOT NULL,
+        total_km REAL NOT NULL,
+
+        fare_krw REAL NOT NULL,
+        fuel_price_krw_per_l REAL NOT NULL,
+        toll_krw REAL NOT NULL,
+        parking_krw REAL NOT NULL,
+        other_krw REAL NOT NULL,
+
+        fuel_used_l REAL NOT NULL,
+        fuel_cost_krw REAL NOT NULL,
+        total_cost_krw REAL NOT NULL,
+        profit_krw REAL NOT NULL,
+        profit_pct REAL NOT NULL,
+
+        origin_text TEXT,
+        dest_text TEXT,
+        route_mode TEXT,
+
+        created_at TEXT NOT NULL
+      )
+    """)
+
+    def pick(colname: str, fallback: str) -> str:
+        return colname if colname in cols else fallback
+
+    paid_col = pick("paid_oneway_km", pick("paid_distance_km", "0"))
+    empty_col = pick("empty_oneway_km", pick("empty_distance_km", "0"))
+    total_col = pick("total_km", pick("total_distance_km", "0"))
+    other_col = pick("other_krw", pick("other_cost_krw", "0"))
+    profitpct_col = pick("profit_pct", pick("profit_margin_pct", "0"))
+
+    origin_col = pick("origin_text", "''")
+    dest_col = pick("dest_text", "''")
+    route_col = pick("route_mode", "''")
+
+    cur.execute(f"""
+      INSERT INTO trips_v2(
+        user_id, trip_date, vehicle_id, trip_type,
+        paid_oneway_km, empty_oneway_km, total_km,
+        fare_krw, fuel_price_krw_per_l, toll_krw, parking_krw, other_krw,
+        fuel_used_l, fuel_cost_krw, total_cost_krw, profit_krw, profit_pct,
+        origin_text, dest_text, route_mode,
+        created_at
+      )
+      SELECT
+        {pick("user_id","1")} as user_id,
+        {pick("trip_date", pick("created_at","datetime('now')"))} as trip_date,
+        {pick("vehicle_id","1")} as vehicle_id,
+        {pick("trip_type","'편도'")} as trip_type,
+
+        {paid_col} as paid_oneway_km,
+        {empty_col} as empty_oneway_km,
+        {total_col} as total_km,
+
+        {pick("fare_krw","0")} as fare_krw,
+        {pick("fuel_price_krw_per_l","0")} as fuel_price_krw_per_l,
+        {pick("toll_krw","0")} as toll_krw,
+        {pick("parking_krw","0")} as parking_krw,
+        {other_col} as other_krw,
+
+        {pick("fuel_used_l","0")} as fuel_used_l,
+        {pick("fuel_cost_krw","0")} as fuel_cost_krw,
+        {pick("total_cost_krw","0")} as total_cost_krw,
+        {pick("profit_krw","0")} as profit_krw,
+        {profitpct_col} as profit_pct,
+
+        {origin_col} as origin_text,
+        {dest_col} as dest_text,
+        {route_col} as route_mode,
+
+        {pick("created_at","datetime('now')")} as created_at
+      FROM trips
+    """)
+
+    cur.execute("DROP TABLE trips")
+    cur.execute("ALTER TABLE trips_v2 RENAME TO trips")
+    conn.commit()
 
 # ============================================================
 # Fuel daily (OPINET) best-effort
 # ============================================================
 def refresh_fuel_prices_daily_if_needed():
-    # If today already exists, skip
     today = date.today().isoformat()
     conn = get_conn()
     cur = conn.cursor()
@@ -162,7 +268,6 @@ def refresh_fuel_prices_daily_if_needed():
     headers = {"User-Agent": "Mozilla/5.0"}
     prices = {}
 
-    # Gas/Diesel (heuristic)
     try:
         r = requests.get("https://www.opinet.co.kr/user/dopospdrg/dopOsPdrgAreaView.do", headers=headers, timeout=10)
         if r.status_code == 200:
@@ -181,7 +286,6 @@ def refresh_fuel_prices_daily_if_needed():
     except Exception:
         pass
 
-    # LPG
     try:
         r = requests.get("https://www.opinet.co.kr/user/dopvsavsel/dopVsAvselSelect.do", headers=headers, timeout=10)
         if r.status_code == 200:
@@ -265,6 +369,17 @@ def init_db():
       )
     """)
     cur.execute("""
+      CREATE TABLE IF NOT EXISTS fuel_prices_daily(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        price_date TEXT NOT NULL,
+        fuel_type TEXT NOT NULL,
+        price_krw_per_l REAL NOT NULL,
+        source TEXT NOT NULL,
+        fetched_at TEXT NOT NULL,
+        UNIQUE(price_date, fuel_type)
+      )
+    """)
+    cur.execute("""
       CREATE TABLE IF NOT EXISTS trips(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
@@ -295,29 +410,9 @@ def init_db():
         created_at TEXT NOT NULL
       )
     """)
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS fuel_prices_daily(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        price_date TEXT NOT NULL,
-        fuel_type TEXT NOT NULL,
-        price_krw_per_l REAL NOT NULL,
-        source TEXT NOT NULL,
-        fetched_at TEXT NOT NULL,
-        UNIQUE(price_date, fuel_type)
-      )
-    """)
 
-    # migrations
-    if not col_exists(conn, "users", "recovery_hash"):
-        try:
-            cur.execute("ALTER TABLE users ADD COLUMN recovery_hash TEXT")
-        except Exception:
-            pass
-    if not col_exists(conn, "users", "role"):
-        try:
-            cur.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
-        except Exception:
-            pass
+    # migrate if old schema exists
+    migrate_trips_table_if_needed(conn)
 
     conn.commit()
 
@@ -400,30 +495,6 @@ def get_user_info(user_id: int):
         return ("user", "user")
     return row[0], row[1]
 
-def get_user_pw_hash(user_id: int) -> str | None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT pw_hash FROM users WHERE id=?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def set_user_password(user_id: int, new_password: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET pw_hash=? WHERE id=?", (_pbkdf2_hash(new_password), user_id))
-    conn.commit()
-    conn.close()
-
-def user_has_any_vehicle(user_id: int) -> bool:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM vehicles WHERE user_id=?", (user_id,))
-    cnt = cur.fetchone()[0]
-    conn.close()
-    return cnt > 0
-
-# token hash
 def _token_pepper() -> str:
     p = (os.getenv("APP_TOKEN_PEPPER", "") or "").strip()
     if p:
@@ -474,7 +545,7 @@ def revoke_login_token(token: str):
     conn.close()
 
 # ============================================================
-# Vehicles / Trips
+# Vehicles / trips
 # ============================================================
 def list_vehicles_df(user_id: int) -> pd.DataFrame:
     conn = get_conn()
@@ -573,9 +644,6 @@ def trips_report(user_id: int, start: date, end: date, vehicle_id: int | None):
     conn.close()
     return df
 
-# ============================================================
-# Admin
-# ============================================================
 def admin_list_users():
     conn = get_conn()
     df = pd.read_sql_query("SELECT id, username, role, created_at FROM users ORDER BY created_at DESC", conn)
@@ -583,7 +651,7 @@ def admin_list_users():
     return df
 
 # ============================================================
-# Kakao search + directions
+# Kakao
 # ============================================================
 KAKAO_LOCAL_KEYWORD_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
 KAKAO_LOCAL_ADDRESS_URL = "https://dapi.kakao.com/v2/local/search/address.json"
@@ -596,39 +664,28 @@ def kakao_search_places(query: str, size_address: int = 6, size_keyword: int = 1
     q = (query or "").strip()
     if not q:
         return []
-
     results = []
-
-    # address
     try:
         r = requests.get(KAKAO_LOCAL_ADDRESS_URL, headers=_kakao_headers(), params={"query": q, "size": int(size_address)}, timeout=10)
         if r.status_code == 200:
             docs = (r.json() or {}).get("documents", []) or []
             for d in docs:
                 x = d.get("x"); y = d.get("y")
-                road = ""
-                jibun = ""
-                if d.get("road_address"):
-                    road = d["road_address"].get("address_name") or ""
-                if d.get("address"):
-                    jibun = d["address"].get("address_name") or ""
+                road = (d.get("road_address") or {}).get("address_name") if d.get("road_address") else ""
+                jibun = (d.get("address") or {}).get("address_name") if d.get("address") else ""
                 label = road or jibun or q
-                results.append({"x": x, "y": y, "place_name": label, "road_address_name": road, "address_name": jibun, "_source":"address"})
+                results.append({"x": x, "y": y, "place_name": label, "road_address_name": road or "", "address_name": jibun or ""})
     except Exception:
         pass
-
-    # keyword
     try:
         r = requests.get(KAKAO_LOCAL_KEYWORD_URL, headers=_kakao_headers(), params={"query": q, "size": int(size_keyword)}, timeout=10)
         if r.status_code == 200:
             docs = (r.json() or {}).get("documents", []) or []
             for d in docs:
-                d["_source"] = "keyword"
                 results.append(d)
     except Exception:
         pass
 
-    # dedupe
     seen = set()
     merged = []
     for d in results:
@@ -666,7 +723,6 @@ def kakao_route(origin_lng: float, origin_lat: float, dest_lng: float, dest_lat:
     except Exception:
         return None
 
-# browser geo
 def get_browser_geolocation():
     html = """
     <script>
@@ -695,66 +751,23 @@ inject_css()
 init_db()
 refresh_fuel_prices_daily_if_needed()
 
-# ------------------------------------------------------------
-# session defaults (avoid StreamlitAPIException)
-# ------------------------------------------------------------
-defaults = {
-    "user_id": None,
-    "username": None,
-    "role": None,
-    "page": None,
-    "selected_vehicle_id": None,
+# session basics
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+if "username" not in st.session_state:
+    st.session_state.username = None
+if "role" not in st.session_state:
+    st.session_state.role = None
+if "page" not in st.session_state:
+    st.session_state.page = "운행 입력"
+if "selected_vehicle_id" not in st.session_state:
+    st.session_state.selected_vehicle_id = None
 
-    "origin_mode": "출발지 주소/장소명",
-    "origin_query": "",
-    "dest_query": "",
-    "origin_pick_idx": 0,
-    "dest_pick_idx": 0,
-    "_origin_pick": None,
-    "_dest_pick": None,
-    "_geo": None,
-
-    # formatted inputs with units inside
-    "trip_type": "편도",
-    "paid_oneway_km_txt": "0KM",
-    "empty_oneway_km_txt": "0KM",
-    "fare_krw_txt": "30,000원",
-    "fuel_price_txt": "0원/L",
-    "fuel_user_edited": False,
-    "toll_krw_txt": "0원",
-    "toll_user_edited": False,
-    "parking_krw_txt": "0원",
-    "other_cost_krw_txt": "0원",
-
-    # pending updates (apply before widgets)
-    "origin_query_pending": None,
-    "dest_query_pending": None,
-    "fuel_price_pending": None,
-    "toll_pending": None,
-}
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-# apply pending before widgets render
-for pend_key, target_key in [
-    ("origin_query_pending", "origin_query"),
-    ("dest_query_pending", "dest_query"),
-    ("fuel_price_pending", "fuel_price_txt"),
-    ("toll_pending", "toll_krw_txt"),
-]:
-    if st.session_state.get(pend_key) is not None:
-        st.session_state[target_key] = st.session_state[pend_key]
-        st.session_state[pend_key] = None
-
-# ------------------------------------------------------------
-# auto-login from URL token
-# ------------------------------------------------------------
+# login persistence via URL token
 try:
     token_from_url = st.query_params.get("t", "")  # type: ignore
 except Exception:
     token_from_url = ""
-
 if (not st.session_state.user_id) and token_from_url:
     uid = validate_login_token(token_from_url)
     if uid:
@@ -762,11 +775,6 @@ if (not st.session_state.user_id) and token_from_url:
         st.session_state.user_id = uid
         st.session_state.username = uname
         st.session_state.role = role
-    else:
-        try:
-            st.query_params.clear()  # type: ignore
-        except Exception:
-            pass
 
 def do_logout():
     try:
@@ -779,16 +787,14 @@ def do_logout():
         st.query_params.clear()  # type: ignore
     except Exception:
         pass
-    for k in ["user_id", "username", "role"]:
-        st.session_state[k] = None
+    st.session_state.user_id = None
+    st.session_state.username = None
+    st.session_state.role = None
     st.rerun()
 
-# ------------------------------------------------------------
-# Login / Signup / Reset
-# ------------------------------------------------------------
+# login/signup/reset UI
 def login_screen():
     st.markdown('<div class="card"><h2>🔐 로그인</h2><p class="muted">회원가입 / 비밀번호 찾기 가능</p></div>', unsafe_allow_html=True)
-
     tab_login, tab_signup, tab_reset = st.tabs(["로그인", "회원가입", "비밀번호 찾기"])
 
     with tab_login:
@@ -799,7 +805,7 @@ def login_screen():
             if not row:
                 st.error("아이디가 없어요.")
                 return
-            uid, uname, pw_hash, _recovery, role = row
+            uid, uname, pw_hash, _rec, role = row
             if _verify_pbkdf2(p, pw_hash):
                 st.session_state.user_id = int(uid)
                 st.session_state.username = uname
@@ -845,9 +851,7 @@ USER_ID = int(st.session_state.user_id)
 USERNAME = st.session_state.username or "user"
 ROLE = st.session_state.role or "user"
 
-# ============================================================
-# Sidebar menu (카카오키 숨김)
-# ============================================================
+# Sidebar (logout + vehicle)
 with st.sidebar:
     st.markdown(f"### 👤 {USERNAME} <span class='pill'>{'관리자' if ROLE=='admin' else '사용자'}</span>", unsafe_allow_html=True)
     if st.button("로그아웃"):
@@ -861,17 +865,19 @@ with st.sidebar:
     else:
         st.session_state.selected_vehicle_id = None
 
-    st.divider()
-    menu = ["차량 등록", "운행 입력", "내역/리포트", "개인정보변경"]
-    if ROLE == "admin":
-        menu.append("관리자")
-    st.session_state.page = st.radio("메뉴", menu, index=menu.index(st.session_state.page) if st.session_state.page in menu else 1)
+# =========================
+# TOP NAV BAR
+# =========================
+menu = ["차량 등록", "운행 입력", "내역/리포트", "개인정보변경"]
+if ROLE == "admin":
+    menu.append("관리자")
+st.session_state.page = st.radio("메뉴", menu, horizontal=True, index=menu.index(st.session_state.page) if st.session_state.page in menu else 1)
 
-# ============================================================
-# Page: 차량 등록
-# ============================================================
+# =========================
+# Pages
+# =========================
 if st.session_state.page == "차량 등록":
-    st.markdown('<div class="card"><h2>🚗 차량 등록</h2><p class="muted">차량 종류 / 유종 / 연비</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="card"><h2>🚗 차량 등록</h2></div>', unsafe_allow_html=True)
     with st.form("veh_add", clear_on_submit=True):
         name = st.text_input("차량 종류")
         fuel = st.selectbox("유종", ["휘발유", "경유", "LPG"])
@@ -882,14 +888,9 @@ if st.session_state.page == "차량 등록":
             else:
                 add_vehicle(USER_ID, name, fuel, int(eff))
                 st.success("등록 완료!")
-                st.session_state.page = "운행 입력"
                 st.rerun()
 
-# ============================================================
-# Page: 운행 입력 (주소 검색/리스트/네비 복구)
-# ============================================================
 elif st.session_state.page == "운행 입력":
-    vdf = list_vehicles_df(USER_ID)
     if vdf.empty:
         st.warning("차량을 먼저 등록해줘.")
         st.stop()
@@ -900,38 +901,48 @@ elif st.session_state.page == "운행 입력":
     auto_p, auto_d, auto_s = latest_fuel_price(vehicle_row["fuel_type"])
     auto_int = iround(auto_p) if auto_p is not None else 1700
 
-    # auto fuel default (editable; don't overwrite if user edited)
+    # init input states if missing
+    for k, v in {
+        "origin_mode": "출발지 주소/장소명",
+        "origin_query": "",
+        "dest_query": "",
+        "trip_type": "편도",
+        "paid_oneway_km_txt": "0KM",
+        "empty_oneway_km_txt": "0KM",
+        "fare_krw_txt": "30,000원",
+        "fuel_price_txt": f"{auto_int:,}원/L",
+        "fuel_user_edited": False,
+        "toll_krw_txt": "0원",
+        "toll_user_edited": False,
+        "parking_krw_txt": "0원",
+        "other_cost_krw_txt": "0원",
+        "_geo": None,
+    }.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
     if not st.session_state["fuel_user_edited"]:
-        st.session_state["fuel_price_pending"] = f"{auto_int:,}원/L"
+        st.session_state["fuel_price_txt"] = f"{auto_int:,}원/L"
 
     st.markdown(
-        f"""
-        <div class="card">
-          <h2>💰 운행 입력</h2>
-          <div class="muted">
-            차량: <b>{vehicle_row['name']}</b> ({vehicle_row['fuel_type']}, 연비 {iround(vehicle_row['fuel_eff_km_per_l'])}KM/L)
-            <br/>오늘 전국 평균 유가(자동 기본): <b>{auto_int:,}원/L</b> ({auto_d or '-'} / {auto_s or 'OPINET'})
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+        f"<div class='card'><h2>💰 운행 입력</h2>"
+        f"<div class='muted'>차량: <b>{vehicle_row['name']}</b> ({vehicle_row['fuel_type']}, 연비 {iround(vehicle_row['fuel_eff_km_per_l'])}KM/L)"
+        f"<br/>유가(전국 평균 자동): <b>{auto_int:,}원/L</b> ({auto_d or '-'} / {auto_s or 'OPINET'})</div></div>",
+        unsafe_allow_html=True
     )
 
-    # ---- 네비 섹션 ----
-    st.markdown('<div class="card"><h3>📍 출발지/도착지 검색</h3><p class="muted">주소/장소명 입력 → 리스트 선택 → 거리/톨비 계산</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="card"><h3>📍 출발지/도착지</h3><p class="muted">검색 리스트 → 선택 → 거리/톨비 계산</p></div>', unsafe_allow_html=True)
+
+    origin_mode = st.selectbox("출발지 방식", ["현재 위치", "출발지 주소/장소명"], index=1)
+    st.text_input("출발지 입력", key="origin_query", disabled=(origin_mode == "현재 위치"))
+    st.text_input("도착지 입력", key="dest_query")
+    route_mode = st.selectbox("경로 옵션", ["추천", "최단시간", "최단거리", "무료도로 우선"], index=0)
+
+    origin_doc = None
+    dest_doc = None
 
     if get_kakao_key():
-        colA, colB = st.columns([2, 5])
-        with colA:
-            st.session_state.origin_mode = st.selectbox("출발지 방식", ["현재 위치", "출발지 주소/장소명"], index=1 if st.session_state.origin_mode != "현재 위치" else 0)
-        with colB:
-            st.text_input("출발지 입력", key="origin_query", disabled=(st.session_state.origin_mode == "현재 위치"))
-
-        st.text_input("도착지 입력", key="dest_query")
-
-        # origin list (only in address mode)
-        origin_doc = None
-        if st.session_state.origin_mode == "출발지 주소/장소명" and st.session_state.origin_query.strip():
+        if origin_mode == "출발지 주소/장소명" and st.session_state.origin_query.strip():
             origin_results = kakao_search_places(st.session_state.origin_query.strip())
             olabels = ["(선택 안 함)"]
             for d in origin_results[:12]:
@@ -939,19 +950,10 @@ elif st.session_state.page == "운행 입력":
                 road = (d.get("road_address_name") or "").strip()
                 jibun = (d.get("address_name") or "").strip()
                 olabels.append(f"{place} | 도로명: {road or '-'} | 지번: {jibun or '-'}")
-            oidx = st.selectbox("출발지 검색 결과", olabels, index=0, key="origin_pick_idx")
-            if oidx != "(선택 안 함)":
-                idx = olabels.index(oidx) - 1
-                if 0 <= idx < len(origin_results[:12]):
-                    origin_doc = origin_results[:12][idx]
-                    # 선택 시 입력칸 반영은 pending+rerun
-                    best = (origin_doc.get("road_address_name") or "").strip() or (origin_doc.get("address_name") or "").strip() or (origin_doc.get("place_name") or "").strip()
-                    if best and best != st.session_state.origin_query:
-                        st.session_state.origin_query_pending = best
-                        st.rerun()
+            opick = st.selectbox("출발지 검색 결과", olabels, index=0)
+            if opick != "(선택 안 함)":
+                origin_doc = origin_results[:12][olabels.index(opick) - 1]
 
-        # dest list
-        dest_doc = None
         if st.session_state.dest_query.strip():
             dest_results = kakao_search_places(st.session_state.dest_query.strip())
             dlabels = ["(선택 안 함)"]
@@ -960,99 +962,63 @@ elif st.session_state.page == "운행 입력":
                 road = (d.get("road_address_name") or "").strip()
                 jibun = (d.get("address_name") or "").strip()
                 dlabels.append(f"{place} | 도로명: {road or '-'} | 지번: {jibun or '-'}")
-            didx = st.selectbox("도착지 검색 결과", dlabels, index=0, key="dest_pick_idx")
-            if didx != "(선택 안 함)":
-                idx = dlabels.index(didx) - 1
-                if 0 <= idx < len(dest_results[:12]):
-                    dest_doc = dest_results[:12][idx]
-                    best = (dest_doc.get("road_address_name") or "").strip() or (dest_doc.get("address_name") or "").strip() or (dest_doc.get("place_name") or "").strip()
-                    if best and best != st.session_state.dest_query:
-                        st.session_state.dest_query_pending = best
-                        st.rerun()
+            dpick = st.selectbox("도착지 검색 결과", dlabels, index=0)
+            if dpick != "(선택 안 함)":
+                dest_doc = dest_results[:12][dlabels.index(dpick) - 1]
 
-        colX1, colX2, colX3 = st.columns([2,2,2])
-        with colX1:
+        colA, colB = st.columns(2)
+        with colA:
             if st.button("현재 위치 가져오기"):
                 st.session_state._geo = get_browser_geolocation()
-        with colX2:
-            route_mode = st.selectbox("경로 옵션", ["추천", "최단시간", "최단거리", "무료도로 우선"], index=0)
-        with colX3:
-            calc = st.button("거리/톨비 계산")
-
-        if calc:
-            # origin coords
-            origin_lng = origin_lat = None
-            if st.session_state.origin_mode == "현재 위치":
-                geo = st.session_state.get("_geo")
-                if not (isinstance(geo, dict) and geo.get("lat") and geo.get("lng")):
-                    st.error("먼저 '현재 위치 가져오기'를 눌러 위치 권한을 허용해줘.")
+        with colB:
+            if st.button("거리/톨비 계산"):
+                origin_lng = origin_lat = None
+                if origin_mode == "현재 위치":
+                    geo = st.session_state.get("_geo")
+                    if not (isinstance(geo, dict) and geo.get("lat") and geo.get("lng")):
+                        st.error("먼저 '현재 위치 가져오기'로 권한 허용해줘.")
+                    else:
+                        origin_lat = float(geo["lat"]); origin_lng = float(geo["lng"])
                 else:
-                    origin_lat = float(geo["lat"])
-                    origin_lng = float(geo["lng"])
-            else:
-                if not origin_doc:
-                    st.error("출발지 검색 결과에서 하나를 선택해줘.")
-                else:
-                    origin_lng = float(origin_doc["x"])
-                    origin_lat = float(origin_doc["y"])
+                    if not origin_doc:
+                        st.error("출발지 검색 결과에서 하나를 선택해줘.")
+                    else:
+                        origin_lng = float(origin_doc["x"]); origin_lat = float(origin_doc["y"])
 
-            # dest coords
-            if not dest_doc:
-                st.error("도착지 검색 결과에서 하나를 선택해줘.")
-            elif origin_lng is not None and origin_lat is not None:
-                dest_lng = float(dest_doc["x"])
-                dest_lat = float(dest_doc["y"])
+                if not dest_doc:
+                    st.error("도착지 검색 결과에서 하나를 선택해줘.")
+                elif origin_lng is not None and origin_lat is not None:
+                    dest_lng = float(dest_doc["x"]); dest_lat = float(dest_doc["y"])
 
-                # map option
-                if route_mode == "추천":
-                    priority, avoid = "RECOMMEND", None
-                elif route_mode == "최단시간":
-                    priority, avoid = "TIME", None
-                elif route_mode == "최단거리":
-                    priority, avoid = "DISTANCE", None
-                else:
-                    priority, avoid = "RECOMMEND", "toll"
+                    if route_mode == "추천":
+                        priority, avoid = "RECOMMEND", None
+                    elif route_mode == "최단시간":
+                        priority, avoid = "TIME", None
+                    elif route_mode == "최단거리":
+                        priority, avoid = "DISTANCE", None
+                    else:
+                        priority, avoid = "RECOMMEND", "toll"
 
-                res = kakao_route(origin_lng, origin_lat, dest_lng, dest_lat, priority=priority, avoid=avoid)
-                if not res:
-                    st.error("길찾기 실패(권한/키/네트워크 확인).")
-                else:
-                    km_oneway = iround(res["distance_m"] / 1000.0)
-                    toll_oneway = iround(res["toll_krw"])
-                    minutes_oneway = iround(res["duration_s"] / 60.0)
+                    res = kakao_route(origin_lng, origin_lat, dest_lng, dest_lat, priority=priority, avoid=avoid)
+                    if not res:
+                        st.error("길찾기 실패")
+                    else:
+                        km_oneway = iround(res["distance_m"] / 1000.0)
+                        toll_oneway = iround(res["toll_krw"])
+                        st.session_state["paid_oneway_km_txt"] = f"{km_oneway:,}KM"
+                        if not st.session_state["toll_user_edited"]:
+                            st.session_state["toll_krw_txt"] = f"{toll_oneway:,}원"
+                        st.success(f"거리(편도): {km_oneway:,}KM / 톨비(편도): {toll_oneway:,}원")
 
-                    # auto fill distance always
-                    st.session_state["paid_oneway_km_txt"] = f"{km_oneway:,}KM"
-
-                    # auto fill toll only if user did not edit toll
-                    if not st.session_state["toll_user_edited"]:
-                        if st.session_state["trip_type"] == "왕복":
-                            st.session_state["toll_pending"] = f"{(toll_oneway*2):,}원"
-                        else:
-                            st.session_state["toll_pending"] = f"{toll_oneway:,}원"
-
-                    st.success(f"거리(편도): {km_oneway:,}KM / 톨비(편도): {toll_oneway:,}원 / 소요(편도): {minutes_oneway:,}분")
-                    st.rerun()
     else:
-        st.info("네비 기능은 서버에 카카오 키가 설정된 경우에만 동작합니다. (키는 화면에 표시하지 않음)")
+        st.warning("Streamlit Cloud Secrets에 KAKAO_REST_API_KEY가 없으면 검색/길찾기가 동작하지 않습니다.")
 
-    # ---- 입력 섹션 (포맷팅) ----
     st.markdown('<div class="card"><h3>🧾 운행 정보 입력</h3><p class="muted">입력칸 안에 단위가 자동으로 붙습니다.</p></div>', unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns(3)
     with col1:
         trip_date = st.date_input("운행 날짜", value=date.today())
         st.session_state["trip_type"] = st.selectbox("운행 형태", ["편도", "왕복"], index=0 if st.session_state["trip_type"] == "편도" else 1)
-
-    # if trip type changes and toll is auto (user not edited), update using latest nav toll
-    if not st.session_state["toll_user_edited"]:
-        current_toll = parse_int(st.session_state["toll_krw_txt"])
-        # if previously filled, keep; we only adjust if already computed from nav (heuristic: if not 0)
-        if current_toll > 0:
-            # can't know one-way toll perfectly; but if 왕복, keep as-is; if switched, halve is risky.
-            # So we only adjust when we have a pending nav fill (handled earlier). Keep stable here.
-            pass
-
     with col2:
         st.text_input("유상거리(편도)", key="paid_oneway_km_txt", on_change=unit_formatter("paid_oneway_km_txt", "KM"))
         st.text_input("공차거리(편도)", key="empty_oneway_km_txt", on_change=unit_formatter("empty_oneway_km_txt", "KM"))
@@ -1069,7 +1035,6 @@ elif st.session_state.page == "운행 입력":
     with col7:
         st.text_input("기타비용", key="other_cost_krw_txt", on_change=unit_formatter("other_cost_krw_txt", "원"))
 
-    # KPI preview
     paid = parse_int(st.session_state["paid_oneway_km_txt"])
     empty = parse_int(st.session_state["empty_oneway_km_txt"])
     fare = parse_int(st.session_state["fare_krw_txt"])
@@ -1077,6 +1042,7 @@ elif st.session_state.page == "운행 입력":
     toll = parse_int(st.session_state["toll_krw_txt"])
     parking = parse_int(st.session_state["parking_krw_txt"])
     other = parse_int(st.session_state["other_cost_krw_txt"])
+
     mult = 2 if st.session_state["trip_type"] == "왕복" else 1
     total_km = (paid + empty) * mult
     eff = float(vehicle_row["fuel_eff_km_per_l"])
@@ -1085,37 +1051,29 @@ elif st.session_state.page == "운행 입력":
     total_cost = fuel_cost + toll + parking + other
     profit = fare - total_cost
 
-    kc1, kc2, kc3, kc4 = st.columns(4)
-    kc1.metric("예상 총거리", fmt_km(total_km))
-    kc2.metric("예상 기름값", fmt_won(fuel_cost))
-    kc3.metric("예상 총비용", fmt_won(total_cost))
-    kc4.metric("예상 순이익", fmt_won(profit))
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("예상 총거리", fmt_km(total_km))
+    k2.metric("예상 기름값", fmt_won(fuel_cost))
+    k3.metric("예상 총비용", fmt_won(total_cost))
+    k4.metric("예상 순이익", fmt_won(profit))
 
     if st.button("저장"):
         if (paid <= 0 and empty <= 0) or fare <= 0 or fuel_price <= 0:
             st.error("거리/운임료/유가를 확인해줘.")
         else:
             save_trip(
-                USER_ID,
-                vehicle_row,
-                trip_date,
-                st.session_state["trip_type"],
-                paid, empty, fare, fuel_price,
-                toll, parking, other,
+                USER_ID, vehicle_row, trip_date, st.session_state["trip_type"],
+                paid, empty, fare, fuel_price, toll, parking, other,
                 origin_text=st.session_state.get("origin_query","").strip(),
                 dest_text=st.session_state.get("dest_query","").strip(),
-                route_mode=""
+                route_mode=route_mode
             )
             st.success("저장 완료!")
             st.rerun()
 
-# ============================================================
-# Page: 내역/리포트
-# ============================================================
 elif st.session_state.page == "내역/리포트":
-    st.markdown('<div class="card"><h2>📊 내역/리포트</h2><p class="muted">요약/차트/표</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="card"><h2>📊 내역/리포트</h2></div>', unsafe_allow_html=True)
 
-    vdf = list_vehicles_df(USER_ID)
     if vdf.empty:
         st.info("차량을 먼저 등록해줘.")
         st.stop()
@@ -1135,55 +1093,11 @@ elif st.session_state.page == "내역/리포트":
         st.info("해당 기간 데이터가 없어.")
         st.stop()
 
-    df_dt = df.copy()
-    df_dt["d"] = pd.to_datetime(df_dt["trip_date"]).dt.date
-
-    # summary today/week/month
-    def sum_block(sub: pd.DataFrame):
-        if sub.empty:
-            return 0,0,0,0
-        return (
-            iround(sub["total_km"].sum()),
-            iround(sub["fare_krw"].sum()),
-            iround(sub["total_cost_krw"].sum()),
-            iround(sub["profit_krw"].sum()),
-        )
-
-    week_start = today - timedelta(days=today.weekday())
-    month_start = date(today.year, today.month, 1)
-
-    t_km, t_f, t_c, t_p = sum_block(df_dt[df_dt["d"] == today])
-    w_km, w_f, w_c, w_p = sum_block(df_dt[(df_dt["d"] >= week_start) & (df_dt["d"] <= today)])
-    m_km, m_f, m_c, m_p = sum_block(df_dt[(df_dt["d"] >= month_start) & (df_dt["d"] <= today)])
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown('<div class="card"><h3>오늘</h3></div>', unsafe_allow_html=True)
-        st.metric("총거리", fmt_km(t_km))
-        st.metric("총운임료", fmt_won(t_f))
-        st.metric("총비용", fmt_won(t_c))
-        st.metric("총순이익", fmt_won(t_p))
-    with c2:
-        st.markdown('<div class="card"><h3>이번주</h3></div>', unsafe_allow_html=True)
-        st.metric("총거리", fmt_km(w_km))
-        st.metric("총운임료", fmt_won(w_f))
-        st.metric("총비용", fmt_won(w_c))
-        st.metric("총순이익", fmt_won(w_p))
-    with c3:
-        st.markdown('<div class="card"><h3>이번달</h3></div>', unsafe_allow_html=True)
-        st.metric("총거리", fmt_km(m_km))
-        st.metric("총운임료", fmt_won(m_f))
-        st.metric("총비용", fmt_won(m_c))
-        st.metric("총순이익", fmt_won(m_p))
-
-    chart = df_dt.groupby("d", as_index=False).agg(
-        fare=("fare_krw","sum"),
-        cost=("total_cost_krw","sum"),
-        profit=("profit_krw","sum"),
-    ).sort_values("d").set_index("d")
+    df2 = df.copy()
+    df2["d"] = pd.to_datetime(df2["trip_date"]).dt.date
+    chart = df2.groupby("d", as_index=False).agg(fare=("fare_krw","sum"), cost=("total_cost_krw","sum"), profit=("profit_krw","sum")).set_index("d")
     st.line_chart(chart[["fare","cost","profit"]])
 
-    # table view with units
     view = df.copy()
     view.rename(columns={
         "id":"번호","trip_date":"운행일자","vehicle_name":"차량","trip_type":"형태",
@@ -1191,41 +1105,29 @@ elif st.session_state.page == "내역/리포트":
         "fare_krw":"운임료","fuel_price_krw_per_l":"유가","fuel_cost_krw":"기름값",
         "toll_krw":"톨비","parking_krw":"주차비","other_krw":"기타비용",
         "total_cost_krw":"총비용","profit_krw":"순이익","profit_pct":"수익률",
+        "origin_text":"출발지","dest_text":"도착지","route_mode":"경로옵션",
         "created_at":"등록시각"
     }, inplace=True)
 
-    view["유상거리(편도)"] = view["유상거리(편도)"].apply(fmt_km)
-    view["공차거리(편도)"] = view["공차거리(편도)"].apply(fmt_km)
-    view["총거리"] = view["총거리"].apply(fmt_km)
-    view["운임료"] = view["운임료"].apply(fmt_won)
-    view["총비용"] = view["총비용"].apply(fmt_won)
-    view["순이익"] = view["순이익"].apply(fmt_won)
-    view["수익률"] = view["수익률"].apply(fmt_pct)
+    for c in ["유상거리(편도)","공차거리(편도)","총거리"]:
+        view[c] = view[c].apply(fmt_km)
+    for c in ["운임료","총비용","기름값","톨비","주차비","기타비용","순이익"]:
+        view[c] = view[c].apply(fmt_won)
     view["유가"] = view["유가"].apply(fmt_won_per_l)
-    view["기름값"] = view["기름값"].apply(fmt_won)
-    view["톨비"] = view["톨비"].apply(fmt_won)
-    view["주차비"] = view["주차비"].apply(fmt_won)
-    view["기타비용"] = view["기타비용"].apply(fmt_won)
+    view["수익률"] = view["수익률"].apply(fmt_pct)
 
-    def highlight_negative_profit(row):
+    def highlight_negative(row):
         styles = [""] * len(row)
-        try:
-            # 원 문자열에서 숫자 뽑기
-            v = parse_int(row.get("순이익", "0"))
-        except Exception:
-            v = 0
+        v = parse_int(row.get("순이익","0"))
         if v < 0 and "순이익" in row.index:
             idx = list(row.index).index("순이익")
             styles[idx] = "color:#d00;font-weight:800;"
         return styles
 
-    st.dataframe(view.style.apply(highlight_negative_profit, axis=1), width="stretch", hide_index=True)
+    st.dataframe(view.style.apply(highlight_negative, axis=1), width="stretch", hide_index=True)
 
-# ============================================================
-# Page: 개인정보변경
-# ============================================================
 elif st.session_state.page == "개인정보변경":
-    st.markdown('<div class="card"><h2>👤 개인정보변경</h2><p class="muted">비밀번호 변경 / 차량 수정·삭제</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="card"><h2>👤 개인정보변경</h2><p class="muted">차량 수정/삭제 + 비밀번호 변경</p></div>', unsafe_allow_html=True)
 
     with st.expander("🔐 비밀번호 변경", expanded=False):
         old_pw = st.text_input("현재 비밀번호", type="password")
@@ -1237,14 +1139,16 @@ elif st.session_state.page == "개인정보변경":
             elif len(new_pw) < 6:
                 st.error("새 비밀번호는 6자리 이상.")
             else:
-                stored = get_user_pw_hash(USER_ID)
-                if not stored or not _verify_pbkdf2(old_pw, stored):
+                stored = get_conn().execute("SELECT pw_hash FROM users WHERE id=?", (USER_ID,)).fetchone()
+                if not stored or not _verify_pbkdf2(old_pw, stored[0]):
                     st.error("현재 비밀번호가 틀렸어요.")
                 else:
-                    set_user_password(USER_ID, new_pw)
+                    conn = get_conn()
+                    conn.execute("UPDATE users SET pw_hash=? WHERE id=?", (_pbkdf2_hash(new_pw), USER_ID))
+                    conn.commit()
+                    conn.close()
                     st.success("변경 완료!")
 
-    vdf = list_vehicles_df(USER_ID)
     if vdf.empty:
         st.info("등록된 차량이 없어요.")
         st.stop()
@@ -1273,13 +1177,9 @@ elif st.session_state.page == "개인정보변경":
             st.success("삭제 완료!")
             st.rerun()
 
-# ============================================================
-# Page: 관리자
-# ============================================================
 else:
     if ROLE != "admin":
         st.error("권한이 없습니다.")
         st.stop()
-    st.markdown('<div class="card"><h2>🛠 관리자</h2><p class="muted">관리자 전용</p></div>', unsafe_allow_html=True)
-    udf = admin_list_users()
-    st.dataframe(udf, width="stretch", hide_index=True)
+    st.markdown('<div class="card"><h2>🛠 관리자</h2></div>', unsafe_allow_html=True)
+    st.dataframe(admin_list_users(), width="stretch", hide_index=True)
